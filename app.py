@@ -15,11 +15,13 @@ st.write(
 
 # Retrieve API Key from Streamlit Secrets
 try:
-  GEMINI_API_KEY = st.secrets["secrets"]["GEMINI_API_KEY"]
+  GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 except Exception:
   st.error(
-      "API Key missing! Please set GEMINI_API_KEY inside"
-      " .streamlit/secrets.toml"
+      "API Key missing! Please add GEMINI_API_KEY in your Streamlit Cloud"
+      " app's Settings → Secrets (or in .streamlit/secrets.toml for local"
+      " dev), like this:\n\n"
+      "GEMINI_API_KEY = \"your_actual_key_here\""
   )
   st.stop()
 
