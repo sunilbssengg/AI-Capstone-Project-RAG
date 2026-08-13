@@ -74,43 +74,74 @@ with st.sidebar:
 
   if uploaded_file is not None:
     if st.button("Process & Ingest Document"):
-      with st.spinner("Saving file, chunking text, and embedding to Chroma..."):
-        try:
-          docs, saved_path = save_and_load_document(uploaded_file)
-          vector_store, chunk_count = process_documents_to_vectorstore(
-              docs, GEMINI_API_KEY
+      # Visible, persistent progress — this stays on screen (does not
+      # collapse or disappear like st.spinner does) so token/chunking/
+      # embedding detail is actually readable, not hidden behind a spinner.
+      progress_bar = st.progress(0, text="Starting ingestion...")
+      log_box = st.empty()
+      log_lines: list[str] = []
+
+      def log(line: str):
+        log_lines.append(line)
+        log_box.markdown("\n".join(f"- {entry}" for entry in log_lines))
+
+      def on_progress(stage: str, **info):
+        if stage == "chunking_start":
+          progress_bar.progress(0.05, text="Chunking document...")
+          log("📄 Splitting document into chunks...")
+        elif stage == "chunking_done":
+          progress_bar.progress(0.15, text="Chunking complete")
+          log(
+              f"✂️ **Chunking complete** — {info['chunk_count']} chunks, "
+              f"{info['total_chars']:,} characters "
+              f"(≈{info['approx_tokens']:,} tokens, estimated)"
           )
+        elif stage == "embedding_progress":
+          done, total = info["done"], info["total"]
+          pct = 0.15 + 0.85 * (done / total)
+          progress_bar.progress(pct, text=f"Embedding chunk {done}/{total}")
+          log(f"🧬 Embedded chunk **{done}/{total}**")
+        elif stage == "embedding_done":
+          progress_bar.progress(1.0, text="Embedding complete")
+          log(f"✅ **Embedding complete** — {info['total']} chunks stored in ChromaDB")
 
-          github_url = None
-          chroma_files_pushed = 0
-          if GITHUB_TOKEN and GITHUB_REPO:
-            try:
-              github_url = push_file_to_github(
-                  saved_path, GITHUB_TOKEN, GITHUB_REPO
-              )
-              chroma_files_pushed = push_folder_to_github(
-                  CHROMA_DIR, GITHUB_TOKEN, GITHUB_REPO
-              )
-            except Exception as gh_err:
-              st.warning(f"Saved locally, but GitHub backup failed: {gh_err}")
+      try:
+        docs, saved_path = save_and_load_document(uploaded_file)
+        log(f"💾 Saved file to `{saved_path}`")
 
-          # A new/changed vector store invalidates any cached agent below.
-          st.session_state.pop("agent_executor", None)
+        vector_store, chunk_count = process_documents_to_vectorstore(
+            docs, GEMINI_API_KEY, progress_callback=on_progress
+        )
 
-          st.success(f"Successfully processed {uploaded_file.name}!")
-          st.info(
-              f"Saved to: `{saved_path}`\n\nGenerated **{chunk_count}** chunks"
-              " inside `chroma_db/`"
-              + (f"\n\nBacked up to GitHub: {github_url}" if github_url else "")
-              + (
-                  f"\n\nSynced **{chroma_files_pushed}** vector store files"
-                  " to GitHub"
-                  if chroma_files_pushed
-                  else ""
-              )
-          )
-        except Exception as e:
-          st.error(f"Error processing document: {e}")
+        github_url = None
+        chroma_files_pushed = 0
+        if GITHUB_TOKEN and GITHUB_REPO:
+          try:
+            log("☁️ Backing up document to GitHub...")
+            github_url = push_file_to_github(
+                saved_path, GITHUB_TOKEN, GITHUB_REPO
+            )
+            log("☁️ Syncing `chroma_db/` to GitHub...")
+            chroma_files_pushed = push_folder_to_github(
+                CHROMA_DIR, GITHUB_TOKEN, GITHUB_REPO
+            )
+            log(f"☁️ Synced **{chroma_files_pushed}** vector store files to GitHub")
+          except Exception as gh_err:
+            st.warning(f"Saved locally, but GitHub backup failed: {gh_err}")
+
+        # A new/changed vector store invalidates any cached agent below.
+        st.session_state.pop("agent_executor", None)
+
+        st.success(f"Successfully processed {uploaded_file.name}!")
+        st.info(
+            f"Saved to: `{saved_path}`\n\nGenerated **{chunk_count}** chunks"
+            " inside `chroma_db/`"
+            + (f"\n\nBacked up to GitHub: {github_url}" if github_url else "")
+        )
+      except Exception as e:
+        progress_bar.progress(1.0, text="Failed")
+        log(f"❌ **Error:** {e}")
+        st.error(f"Error processing document: {e}")
 
   st.markdown("---")
   st.caption(
