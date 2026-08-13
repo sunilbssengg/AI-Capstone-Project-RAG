@@ -221,7 +221,7 @@ else:
       for warning in warnings:
         st.caption(f"⚠️ {warning}")
 
-      with st.expander("🔍 Agent reasoning trace — Plan → Retrieve → Reason → Generate"):
+      with st.expander("🔍 Agent reasoning trace — Plan → (Retrieve ↔ Reason)* → Generate"):
         stage_icons = {
             "guardrail": "🛡️",
             "plan": "🗺️",
