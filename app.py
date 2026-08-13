@@ -1,14 +1,6 @@
 import streamlit as st
 
 from modules.agents import AgentError, build_agent_executor, run_agent
-from modules.guardrails import (
-    InputValidationError,
-    apply_output_guardrails,
-    detect_prompt_injection,
-    detect_unsafe_request,
-    REFUSAL_MESSAGE,
-    validate_user_input,
-)
 from modules.ingestion import (
     save_and_load_document,
     push_file_to_github,
@@ -145,9 +137,10 @@ with st.sidebar:
 
   st.markdown("---")
   st.caption(
-      "🛡️ Guardrails active: input validation, prompt-injection "
-      "detection, unsafe-request screening, PII redaction, and "
-      "grounding checks on every response."
+      "🛡️ The agent runs Plan → Retrieve → Reason → Generate for every "
+      "question, with input validation, prompt-injection detection, "
+      "unsafe-request screening, PII redaction, and grounding checks "
+      "built into the pipeline."
   )
 
 # --------------------------------------------------------------------------
@@ -192,36 +185,15 @@ else:
       st.markdown(user_query)
 
     with st.chat_message("assistant"):
-      # ---- 1. Input validation --------------------------------------
-      try:
-        clean_query = validate_user_input(user_query)
-      except InputValidationError as e:
-        st.error(str(e))
-        st.session_state.messages.append(
-            {"role": "assistant", "content": str(e), "warnings": []}
-        )
-        st.stop()
-
-      # ---- 2. Pre-generation guardrails -------------------------------
-      if detect_unsafe_request(clean_query):
-        st.warning(REFUSAL_MESSAGE)
-        st.session_state.messages.append(
-            {"role": "assistant", "content": REFUSAL_MESSAGE, "warnings": []}
-        )
-        st.stop()
-
-      injection_flagged = detect_prompt_injection(clean_query)
-      if injection_flagged:
-        st.caption(
-            "🛡️ This message resembles a prompt-injection attempt — it "
-            "will be treated as untrusted input, and the agent's system "
-            "instructions take precedence."
-        )
-
-      # ---- 3. Agent reasoning (with retries/error handling) -----------
+      # Input validation, pre-generation guardrails (unsafe-request /
+      # prompt-injection screening), and post-generation guardrails
+      # (PII redaction, grounding check) all run *inside* agent.run() now
+      # — see EnterpriseRAGAgent.run() in modules/agents.py — so a single
+      # call here covers validate -> plan -> retrieve -> reason ->
+      # generate -> guard end to end.
       with st.spinner("Agent is planning, retrieving, and reasoning..."):
         try:
-          result = run_agent(agent_executor, clean_query)
+          result = run_agent(agent_executor, user_query)
         except AgentError as e:
           error_msg = f"The agent couldn't complete this request: {e}"
           st.error(error_msg)
@@ -241,27 +213,30 @@ else:
           )
           st.stop()
 
-      # ---- 4. Output guardrails ---------------------------------------
-      guarded = apply_output_guardrails(result.answer, result.retrieved_docs)
+      warnings = [
+          entry["detail"] for entry in result.trace if entry["stage"] == "guardrail"
+      ]
 
-      st.markdown(guarded.text)
-      for warning in guarded.warnings:
+      st.markdown(result.answer)
+      for warning in warnings:
         st.caption(f"⚠️ {warning}")
 
-      with st.expander("🔍 Agent reasoning trace"):
-        st.caption(f"Completed in {result.attempts} attempt(s).")
-        if not result.steps:
-          st.caption("The agent answered directly without calling a tool.")
-        for i, (action, observation) in enumerate(result.steps, start=1):
-          st.markdown(f"**Step {i}: `{action.tool}`**")
-          st.code(str(action.tool_input), language="text")
-          st.text(
-              str(observation)[:800]
-              + ("..." if len(str(observation)) > 800 else "")
-          )
+      with st.expander("🔍 Agent reasoning trace — Plan → Retrieve → Reason → Generate"):
+        stage_icons = {
+            "guardrail": "🛡️",
+            "plan": "🗺️",
+            "retrieve": "📚",
+            "reason": "🧠",
+            "generate": "✍️",
+        }
+        for entry in result.trace:
+          icon = stage_icons.get(entry["stage"], "•")
+          detail = str(entry["detail"])
+          st.markdown(f"**{icon} {entry['stage'].capitalize()}**")
+          st.text(detail[:1000] + ("..." if len(detail) > 1000 else ""))
 
       st.session_state.messages.append({
           "role": "assistant",
-          "content": guarded.text,
-          "warnings": guarded.warnings,
+          "content": result.answer,
+          "warnings": warnings,
       })
