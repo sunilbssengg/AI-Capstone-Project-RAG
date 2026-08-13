@@ -11,3 +11,6 @@ enterprise-rag-app/
 │   └── qa_pipeline.py        # Handles vector store retrieval and Gemini 2.5 LLM chain
 ├── app.py                    # Main Streamlit Interface
 └── requirements.txt
+
+
+
