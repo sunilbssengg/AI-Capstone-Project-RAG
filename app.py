@@ -18,7 +18,7 @@ st.set_page_config(
     page_title="Agentic Enterprise RAG with Gemini 2.5", layout="wide"
 )
 
-st.title("🤖 Agentic Enterprise RAG — Reasoning, Tools & Guardrails")
+st.title("🤖 Agentic Enterprise RAG — Reasoning, Tools & Guardrails || Develop by Sunil Kumar")
 st.write(
     "Upload enterprise documents, then ask questions. Unlike a simple "
     "retrieve-then-answer chain, this app uses an **AI agent** that plans "
