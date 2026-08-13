@@ -17,13 +17,13 @@ st.set_page_config(
     page_title="Agentic Enterprise RAG with Gemini 2.5", layout="wide"
 )
 
-st.title("🤖 Agentic Enterprise RAG — Reasoning, Tools & Guardrails")
+st.title("🤖 Agentic Enterprise RAG — Reasoning, Tools & Guardrails || Created by Sunil Kumar")
 st.write(
     "Upload enterprise documents, then ask questions. Unlike a simple "
     "retrieve-then-answer chain, this app uses an **AI agent** that plans "
-    "which tools to call (document search, calculator, document listing), "
     "reasons over the results, and is wrapped in input/output guardrails "
     "to reduce hallucinations and unsafe outputs."
+    "Note: This is for testing only"
 )
 
 # --------------------------------------------------------------------------
@@ -80,11 +80,11 @@ with st.sidebar:
       def on_progress(stage: str, **info):
         if stage == "chunking_start":
           progress_bar.progress(0.05, text="Chunking document...")
-          log("📄 Splitting document into chunks...")
+          log("Splitting document into chunks...")
         elif stage == "chunking_done":
           progress_bar.progress(0.15, text="Chunking complete")
           log(
-              f"✂️ **Chunking complete** — {info['chunk_count']} chunks, "
+              f" **Chunking complete** — {info['chunk_count']} chunks, "
               f"{info['total_chars']:,} characters "
               f"(≈{info['approx_tokens']:,} tokens, estimated)"
           )
@@ -92,14 +92,14 @@ with st.sidebar:
           done, total = info["done"], info["total"]
           pct = 0.15 + 0.85 * (done / total)
           progress_bar.progress(pct, text=f"Embedding chunk {done}/{total}")
-          log(f"🧬 Embedded chunk **{done}/{total}**")
+          log(f"Embedded chunk **{done}/{total}**")
         elif stage == "embedding_done":
           progress_bar.progress(1.0, text="Embedding complete")
-          log(f"✅ **Embedding complete** — {info['total']} chunks stored in ChromaDB")
+          log(f"**Embedding complete** — {info['total']} chunks stored in ChromaDB")
 
       try:
         docs, saved_path = save_and_load_document(uploaded_file)
-        log(f"💾 Saved file to `{saved_path}`")
+        log(f"Saved file to `{saved_path}`")
 
         vector_store, chunk_count = process_documents_to_vectorstore(
             docs, GEMINI_API_KEY, progress_callback=on_progress
@@ -109,15 +109,15 @@ with st.sidebar:
         chroma_files_pushed = 0
         if GITHUB_TOKEN and GITHUB_REPO:
           try:
-            log("☁️ Backing up document to GitHub...")
+            log("Backing up document to GitHub...")
             github_url = push_file_to_github(
                 saved_path, GITHUB_TOKEN, GITHUB_REPO
             )
-            log("☁️ Syncing `chroma_db/` to GitHub...")
+            log(" Syncing `chroma_db/` to GitHub...")
             chroma_files_pushed = push_folder_to_github(
                 CHROMA_DIR, GITHUB_TOKEN, GITHUB_REPO
             )
-            log(f"☁️ Synced **{chroma_files_pushed}** vector store files to GitHub")
+            log(f" Synced **{chroma_files_pushed}** vector store files to GitHub")
           except Exception as gh_err:
             st.warning(f"Saved locally, but GitHub backup failed: {gh_err}")
 
@@ -132,12 +132,12 @@ with st.sidebar:
         )
       except Exception as e:
         progress_bar.progress(1.0, text="Failed")
-        log(f"❌ **Error:** {e}")
+        log(f" **Error:** {e}")
         st.error(f"Error processing document: {e}")
 
   st.markdown("---")
   st.caption(
-      "🛡️ The agent runs Plan → Retrieve → Reason → Generate for every "
+      " The agent runs Plan → Retrieve → Reason → Generate for every "
       "question, with input validation, prompt-injection detection, "
       "unsafe-request screening, PII redaction, and grounding checks "
       "built into the pipeline."
@@ -147,13 +147,13 @@ with st.sidebar:
 # Main: agentic Q&A
 # --------------------------------------------------------------------------
 st.markdown("---")
-st.subheader("💬 Ask Questions — Answered by an AI Agent")
+st.subheader(" Ask Questions — Answered by an AI Agent")
 
 vector_store = load_vectorstore(GEMINI_API_KEY)
 
 if vector_store is None:
   st.warning(
-      "⚠️ No vector database found. Please upload and process a document via"
+      "No vector database found. Please upload and process a document via"
       " the sidebar first."
   )
 else:
@@ -175,7 +175,7 @@ else:
     with st.chat_message(message["role"]):
       st.markdown(message["content"])
       for warning in message.get("warnings", []):
-        st.caption(f"⚠️ {warning}")
+        st.caption(f" {warning}")
 
   if user_query := st.chat_input(
       "Type your question regarding the uploaded documents..."
@@ -219,7 +219,7 @@ else:
 
       st.markdown(result.answer)
       for warning in warnings:
-        st.caption(f"⚠️ {warning}")
+        st.caption(f" {warning}")
 
       with st.expander("🔍 Agent reasoning trace — Plan → (Retrieve ↔ Reason)* → Generate"):
         stage_icons = {
