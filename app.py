@@ -1,4 +1,14 @@
 import streamlit as st
+
+from modules.agents import AgentError, build_agent_executor, run_agent
+from modules.guardrails import (
+    InputValidationError,
+    apply_output_guardrails,
+    detect_prompt_injection,
+    detect_unsafe_request,
+    REFUSAL_MESSAGE,
+    validate_user_input,
+)
 from modules.ingestion import (
     save_and_load_document,
     push_file_to_github,
@@ -10,19 +20,23 @@ from modules.processing import (
     load_vectorstore,
     process_documents_to_vectorstore,
 )
-from modules.qa_pipeline import get_qa_chain
 
 st.set_page_config(
-    page_title="Enterprise RAG with Gemini 2.5", layout="wide"
+    page_title="Agentic Enterprise RAG with Gemini 2.5", layout="wide"
 )
 
-st.title("📄 Enterprise RAG Document Pipeline & Q&A")
+st.title("🤖 Agentic Enterprise RAG — Reasoning, Tools & Guardrails")
 st.write(
-    "Upload enterprise documents (PDF, TXT, CSV, Excel), chunk them, store"
-    " metadata locally in ChromaDB, and query via Gemini 2.5."
+    "Upload enterprise documents, then ask questions. Unlike a simple "
+    "retrieve-then-answer chain, this app uses an **AI agent** that plans "
+    "which tools to call (document search, calculator, document listing), "
+    "reasons over the results, and is wrapped in input/output guardrails "
+    "to reduce hallucinations and unsafe outputs."
 )
 
-# Retrieve API Key from Streamlit Secrets
+# --------------------------------------------------------------------------
+# API key
+# --------------------------------------------------------------------------
 try:
   GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 except Exception:
@@ -34,16 +48,13 @@ except Exception:
   )
   st.stop()
 
-# Optional: GitHub persistence for uploaded files. Only active if both
-# secrets are set — silently skipped otherwise (local-disk-only behavior,
-# same as before). See SECURITY WARNING in modules/ingestion.py before
-# enabling this on a public app.
+# --------------------------------------------------------------------------
+# Optional GitHub persistence (same mechanism as the base RAG app — see
+# SECURITY WARNING in modules/ingestion.py before enabling on a public app)
+# --------------------------------------------------------------------------
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
-GITHUB_REPO = st.secrets.get("GITHUB_REPO", "")  # e.g. "username/reponame"
+GITHUB_REPO = st.secrets.get("GITHUB_REPO", "")
 
-# On a fresh session (e.g. after a Streamlit Cloud restart/redeploy wipes
-# local disk), restore chroma_db from GitHub before anything tries to load
-# it. Only runs once per session and only if GitHub secrets are set.
 if GITHUB_TOKEN and GITHUB_REPO and "chroma_restored" not in st.session_state:
   with st.spinner("Restoring vector database from GitHub..."):
     try:
@@ -52,7 +63,9 @@ if GITHUB_TOKEN and GITHUB_REPO and "chroma_restored" not in st.session_state:
       st.warning(f"Could not restore chroma_db from GitHub: {restore_err}")
   st.session_state["chroma_restored"] = True
 
-# Layout: Sidebar for Uploads, Main Area for Chat
+# --------------------------------------------------------------------------
+# Sidebar: ingestion (same pipeline as the base RAG app)
+# --------------------------------------------------------------------------
 with st.sidebar:
   st.header("📂 Document Ingestion")
   uploaded_file = st.file_uploader(
@@ -63,18 +76,11 @@ with st.sidebar:
     if st.button("Process & Ingest Document"):
       with st.spinner("Saving file, chunking text, and embedding to Chroma..."):
         try:
-          # Step 1: Save and load file
           docs, saved_path = save_and_load_document(uploaded_file)
-
-          # Step 2: Process, Chunk, Embed & Save to Chroma DB
           vector_store, chunk_count = process_documents_to_vectorstore(
               docs, GEMINI_API_KEY
           )
 
-          # Step 3 (optional): Persist the raw file AND the updated
-          # chroma_db/ vector store to GitHub so both survive Streamlit
-          # Cloud restarts. Skipped silently if GITHUB_TOKEN / GITHUB_REPO
-          # secrets aren't configured.
           github_url = None
           chroma_files_pushed = 0
           if GITHUB_TOKEN and GITHUB_REPO:
@@ -87,6 +93,9 @@ with st.sidebar:
               )
             except Exception as gh_err:
               st.warning(f"Saved locally, but GitHub backup failed: {gh_err}")
+
+          # A new/changed vector store invalidates any cached agent below.
+          st.session_state.pop("agent_executor", None)
 
           st.success(f"Successfully processed {uploaded_file.name}!")
           st.info(
@@ -103,9 +112,18 @@ with st.sidebar:
         except Exception as e:
           st.error(f"Error processing document: {e}")
 
-# Main Chat Interface for Q&A
+  st.markdown("---")
+  st.caption(
+      "🛡️ Guardrails active: input validation, prompt-injection "
+      "detection, unsafe-request screening, PII redaction, and "
+      "grounding checks on every response."
+  )
+
+# --------------------------------------------------------------------------
+# Main: agentic Q&A
+# --------------------------------------------------------------------------
 st.markdown("---")
-st.subheader("💬 Ask Questions about your Documents")
+st.subheader("💬 Ask Questions — Answered by an AI Agent")
 
 vector_store = load_vectorstore(GEMINI_API_KEY)
 
@@ -115,24 +133,26 @@ if vector_store is None:
       " the sidebar first."
   )
 else:
-  # Cache the chain so it isn't rebuilt (and the LLM client re-created) on
-  # every single chat message / script rerun.
+
   @st.cache_resource(show_spinner=False)
-  def _build_chain(_vector_store, api_key):
-    return get_qa_chain(_vector_store, api_key)
+  def _build_executor(_vector_store, api_key):
+    return build_agent_executor(_vector_store, api_key)
 
-  rag_chain = _build_chain(vector_store, GEMINI_API_KEY)
+  try:
+    agent_executor = _build_executor(vector_store, GEMINI_API_KEY)
+  except AgentError as e:
+    st.error(f"Could not initialize the agent: {e}")
+    st.stop()
 
-  # Initialize chat history state
   if "messages" not in st.session_state:
     st.session_state.messages = []
 
-  # Display prior chat messages
   for message in st.session_state.messages:
     with st.chat_message(message["role"]):
       st.markdown(message["content"])
+      for warning in message.get("warnings", []):
+        st.caption(f"⚠️ {warning}")
 
-  # Accept user prompt
   if user_query := st.chat_input(
       "Type your question regarding the uploaded documents..."
   ):
@@ -141,14 +161,76 @@ else:
       st.markdown(user_query)
 
     with st.chat_message("assistant"):
-      with st.spinner("Thinking with Gemini 2.5..."):
+      # ---- 1. Input validation --------------------------------------
+      try:
+        clean_query = validate_user_input(user_query)
+      except InputValidationError as e:
+        st.error(str(e))
+        st.session_state.messages.append(
+            {"role": "assistant", "content": str(e), "warnings": []}
+        )
+        st.stop()
+
+      # ---- 2. Pre-generation guardrails -------------------------------
+      if detect_unsafe_request(clean_query):
+        st.warning(REFUSAL_MESSAGE)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": REFUSAL_MESSAGE, "warnings": []}
+        )
+        st.stop()
+
+      injection_flagged = detect_prompt_injection(clean_query)
+      if injection_flagged:
+        st.caption(
+            "🛡️ This message resembles a prompt-injection attempt — it "
+            "will be treated as untrusted input, and the agent's system "
+            "instructions take precedence."
+        )
+
+      # ---- 3. Agent reasoning (with retries/error handling) -----------
+      with st.spinner("Agent is planning, retrieving, and reasoning..."):
         try:
-          response = rag_chain.invoke({"input": user_query})
-          answer = response["answer"]
-          st.markdown(answer)
-          st.session_state.messages.append(
-              {"role": "assistant", "content": answer}
-          )
-        except Exception as e:
-          error_msg = f"An error occurred during generation: {e}"
+          result = run_agent(agent_executor, clean_query)
+        except AgentError as e:
+          error_msg = f"The agent couldn't complete this request: {e}"
           st.error(error_msg)
+          st.session_state.messages.append(
+              {"role": "assistant", "content": error_msg, "warnings": []}
+          )
+          st.stop()
+        except Exception as e:  # noqa: BLE001 - last-resort safety net
+          error_msg = (
+              "An unexpected error occurred while generating the answer. "
+              "Please try rephrasing your question."
+          )
+          st.error(error_msg)
+          st.caption(f"Debug detail: {e}")
+          st.session_state.messages.append(
+              {"role": "assistant", "content": error_msg, "warnings": []}
+          )
+          st.stop()
+
+      # ---- 4. Output guardrails ---------------------------------------
+      guarded = apply_output_guardrails(result.answer, result.retrieved_docs)
+
+      st.markdown(guarded.text)
+      for warning in guarded.warnings:
+        st.caption(f"⚠️ {warning}")
+
+      with st.expander("🔍 Agent reasoning trace"):
+        st.caption(f"Completed in {result.attempts} attempt(s).")
+        if not result.steps:
+          st.caption("The agent answered directly without calling a tool.")
+        for i, (action, observation) in enumerate(result.steps, start=1):
+          st.markdown(f"**Step {i}: `{action.tool}`**")
+          st.code(str(action.tool_input), language="text")
+          st.text(
+              str(observation)[:800]
+              + ("..." if len(str(observation)) > 800 else "")
+          )
+
+      st.session_state.messages.append({
+          "role": "assistant",
+          "content": guarded.text,
+          "warnings": guarded.warnings,
+      })
