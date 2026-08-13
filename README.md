@@ -20,7 +20,7 @@ GitHub-backed `chroma_db/` persistence) are identical to the base project
 generate chain to an agent that plans its own tool calls.
 
 ## 1. Agent-based reasoning
-Plan → Retrieve → Reason → Generate pipeline
+Plan → (Retrieve ↔ Reason)* → Generate
 
 - **`retrieve_documents`** — semantic search over the ingested documents
   (wraps the same Chroma vector store as the base app).
