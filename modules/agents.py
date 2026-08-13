@@ -2,9 +2,9 @@
 Agent-based reasoning layer for the Enterprise RAG app.
 
 This implements a single AI agent (EnterpriseRAGAgent) that runs an
-EXPLICIT four-phase loop for every question:
+EXPLICIT phased loop for every question:
 
-    PLAN  ->  RETRIEVE  ->  REASON  ->  GENERATE
+    PLAN  ->  (RETRIEVE  <->  REASON)*  ->  GENERATE
 
 Each phase is its own function, individually testable, individually
 recoverable on failure, and individually visible in the UI's reasoning
@@ -20,18 +20,31 @@ agent loop. Concretely:
                                  "retrieval tool"), deduplicating results.
   3. REASON   (reason_step)   — the agent reads the retrieved evidence and
                                  reasons over it: what's relevant, what's
-                                 missing, and whether a computation is
-                                 needed — and if so, what expression (the
-                                 agent never does math itself; it only
-                                 decides the expression, which is then
-                                 evaluated by the calculator tool).
-  4. GENERATE (generate_step) — produces the final answer, grounded only
-                                 in the plan/retrieval/reasoning outputs
-                                 already gathered, with citations.
+                                 missing, whether a computation is needed
+                                 (it never does math itself — it only
+                                 decides the expression, evaluated exactly
+                                 by the calculator tool), and — this is
+                                 the actual agentic loop — whether the
+                                 evidence gathered so far is SUFFICIENT.
+                                 If not, it proposes new search angles and
+                                 control goes back to RETRIEVE for another
+                                 round, capped at MAX_LOOP_ITERATIONS so a
+                                 confused agent can't spin indefinitely.
+  4. GENERATE (generate_step) — once reasoning judges the evidence
+                                 sufficient (or the loop cap is hit),
+                                 produces the final answer, grounded only
+                                 in everything gathered above, with
+                                 citations.
 
 Reliability & safety controls:
   - every phase catches its own exceptions and degrades to a safe
     fallback instead of crashing the whole run (see plan_step / reason_step)
+  - the retrieve<->reason loop is hard-capped at MAX_LOOP_ITERATIONS —
+    unbounded agentic loops are a real cost/availability risk, not just a
+    theoretical one
+  - a reasoning-step failure sets sufficient=True (fail-safe): the loop
+    terminates and falls through to generation rather than retrying into
+    a dead end
   - LLM calls are retried with exponential backoff on transient errors
     (rate limits, timeouts, 5xx) via _invoke_llm_with_retry
   - the calculator uses a restricted AST evaluator (no eval()/exec()), so
@@ -71,6 +84,9 @@ MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.5
 MAX_SEARCH_QUERIES = 3
 CHUNKS_PER_QUERY = 4
+MAX_LOOP_ITERATIONS = 3  # bounds the retrieve<->reason loop — a real agentic
+                          # loop must still be capped, or a confused agent
+                          # can spin forever burning API calls and cost.
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +243,8 @@ class ReasoningResult:
   notes: str
   calculation_expression: str | None = None
   calculation_result: str | None = None
+  sufficient: bool = True
+  follow_up_queries: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -305,6 +323,20 @@ def plan_step(llm, user_query: str, available_docs: list[str]) -> Plan:
 # --------------------------------------------------------------------------
 
 
+def _merge_unique(existing: list, new: list) -> list:
+  """Appends docs from `new` into `existing` that aren't already present
+  (by source + content-prefix), preserving order. Used to accumulate
+  evidence across retrieve<->reason loop rounds without duplicates."""
+  seen = {(d.metadata.get("source"), d.page_content[:120]) for d in existing}
+  merged = list(existing)
+  for doc in new:
+    key = (doc.metadata.get("source"), doc.page_content[:120])
+    if key not in seen:
+      seen.add(key)
+      merged.append(doc)
+  return merged
+
+
 def retrieve_step(vector_store, plan: Plan) -> list:
   """RETRIEVE phase: executes every search query in the plan against the
   vector store and deduplicates results across queries."""
@@ -328,33 +360,54 @@ def retrieve_step(vector_store, plan: Plan) -> list:
 
 REASONER_SYSTEM_PROMPT = """You are the reasoning stage of an enterprise \
 document Q&A agent. You are given a user's question and the document \
-excerpts retrieved for it. Think through what the excerpts actually say, \
+excerpts retrieved so far. Think through what the excerpts actually say, \
 whether they're sufficient to answer, and whether a calculation is needed.
 
 Respond with ONLY a JSON object (no markdown fences, no other text):
 {
   "notes": "2-4 sentences: what the excerpts show, and whether they are sufficient to answer the question",
+  "sufficient": true or false,
+  "follow_up_queries": ["short focused search phrase", ...],  // only if sufficient=false, up to 2 NEW angles not already tried
   "calculation_expression": "a Python arithmetic expression using numbers from the excerpts, or null if no calculation is needed"
 }
 
-Critical rule: NEVER compute the arithmetic result yourself in "notes" — \
-only propose the expression in "calculation_expression". The expression \
-will be evaluated by an exact calculator, not by you, because you are not \
+Rules:
+- Set sufficient=false ONLY if the excerpts are clearly missing a piece of \
+information the question needs and a different search phrase could \
+plausibly find it. Do not loop for information that simply doesn't exist \
+in an enterprise document (e.g. general knowledge questions) — in that \
+case sufficient=true and notes should say the documents don't cover it.
+- follow_up_queries must be genuinely different phrasing/angles from the \
+searches already tried, not repeats.
+- NEVER compute the arithmetic result yourself in "notes" — only propose \
+the expression in "calculation_expression". The expression will be \
+evaluated by an exact calculator, not by you, because you are not \
 reliable at mental math.
 """
 
 
-def reason_step(llm, user_query: str, retrieved_docs: list) -> ReasoningResult:
+def reason_step(
+    llm, user_query: str, retrieved_docs: list, tried_queries: list[str]
+) -> ReasoningResult:
   """REASON phase: the agent reads the retrieved evidence and reasons
   about sufficiency and whether arithmetic is needed. If it proposes an
   expression, that expression is evaluated exactly by the calculator tool
   (safe_eval_arithmetic) rather than trusted from the model's own math.
-  Degrades to a neutral pass-through note if the LLM/JSON step fails."""
+  Also self-assesses whether the evidence gathered so far is sufficient —
+  this is what drives the agentic retrieve<->reason loop in
+  EnterpriseRAGAgent.run(). Degrades to a neutral, loop-terminating
+  pass-through note if the LLM/JSON step fails (never loops on a failure,
+  to avoid retrying into a dead end)."""
   context = _format_docs(retrieved_docs)
+  tried = ", ".join(tried_queries) if tried_queries else "(none yet)"
   messages = [
       SystemMessage(content=REASONER_SYSTEM_PROMPT),
       HumanMessage(
-          content=f"Question: {user_query}\n\nRetrieved excerpts:\n{context}"
+          content=(
+              f"Question: {user_query}\n\n"
+              f"Search queries already tried: {tried}\n\n"
+              f"Retrieved excerpts so far:\n{context}"
+          )
       ),
   ]
   try:
@@ -370,17 +423,25 @@ def reason_step(llm, user_query: str, retrieved_docs: list) -> ReasoningResult:
       except Exception as calc_exc:  # noqa: BLE001
         calc_result = f"ERROR: could not evaluate '{expr}' ({calc_exc})"
 
+    follow_ups = data.get("follow_up_queries") or []
+    if not isinstance(follow_ups, list):
+      follow_ups = []
+    follow_ups = [str(q) for q in follow_ups][:2]
+
     return ReasoningResult(
         notes=str(data.get("notes", raw)),
         calculation_expression=expr,
         calculation_result=calc_result,
+        sufficient=bool(data.get("sufficient", True)),
+        follow_up_queries=follow_ups,
     )
   except Exception as exc:  # noqa: BLE001 - reasoning must never crash the run
     return ReasoningResult(
         notes=(
             "Reasoning step failed "
             f"({exc}); proceeding to generation with retrieved context only."
-        )
+        ),
+        sufficient=True,  # fail-safe: terminate the loop, don't retry into a dead end
     )
 
 
@@ -437,12 +498,26 @@ def generate_step(
 # --------------------------------------------------------------------------
 
 
+def _reason_summary(reasoning: ReasoningResult) -> str:
+  summary = reasoning.notes
+  if reasoning.calculation_expression:
+    summary += (
+        f" | calculation: {reasoning.calculation_expression} = "
+        f"{reasoning.calculation_result}"
+    )
+  summary += f" | sufficient={reasoning.sufficient}"
+  if not reasoning.sufficient and reasoning.follow_up_queries:
+    summary += f" | follow_up_queries={reasoning.follow_up_queries}"
+  return summary
+
+
 class EnterpriseRAGAgent:
   """
-  A single AI agent that runs an explicit Plan -> Retrieve -> Reason ->
-  Generate loop for every question, using document retrieval and
-  arithmetic as tools it invokes itself. Wraps the whole run in input
-  validation and pre/post guardrails.
+  A single AI agent that runs an explicit Plan -> (Retrieve <-> Reason)*
+  -> Generate loop for every question, using document retrieval and
+  arithmetic as tools it invokes itself, and re-retrieving when its own
+  reasoning judges the evidence gathered so far insufficient. Wraps the
+  whole run in input validation and pre/post guardrails.
   """
 
   def __init__(self, vector_store, api_key: str):
@@ -486,22 +561,63 @@ class EnterpriseRAGAgent:
         ),
     })
 
-    # ---- Stage 2: RETRIEVE ----------------------------------------------
+    # ---- Stages 2 & 3: RETRIEVE <-> REASON loop --------------------------
+    # This is the actual agentic loop: after reasoning over what's been
+    # retrieved, the agent judges for itself whether the evidence is
+    # sufficient. If not, it proposes new search angles and the loop goes
+    # back for another retrieval round — capped at MAX_LOOP_ITERATIONS so
+    # a confused agent can't spin indefinitely.
+    tried_queries: list[str] = list(plan.search_queries)
     retrieved_docs = retrieve_step(self.vector_store, plan)
     trace.append({
         "stage": "retrieve",
-        "detail": f"{len(retrieved_docs)} unique chunk(s) retrieved across {len(plan.search_queries)} quer(y/ies).",
+        "detail": f"[round 1] {len(retrieved_docs)} unique chunk(s) retrieved for: {plan.search_queries}",
     })
 
-    # ---- Stage 3: REASON --------------------------------------------------
-    reasoning = reason_step(self.llm, clean_query, retrieved_docs)
-    reason_detail = reasoning.notes
-    if reasoning.calculation_expression:
-      reason_detail += (
-          f" | calculation: {reasoning.calculation_expression} = "
-          f"{reasoning.calculation_result}"
+    reasoning = reason_step(self.llm, clean_query, retrieved_docs, tried_queries)
+    trace.append({"stage": "reason", "detail": f"[round 1] {_reason_summary(reasoning)}"})
+
+    round_num = 1
+    while (
+        not reasoning.sufficient
+        and reasoning.follow_up_queries
+        and round_num < MAX_LOOP_ITERATIONS
+    ):
+      round_num += 1
+      follow_up_plan = Plan(
+          needs_retrieval=True,
+          search_queries=reasoning.follow_up_queries,
+          needs_calculation=plan.needs_calculation,
       )
-    trace.append({"stage": "reason", "detail": reason_detail})
+      new_docs = retrieve_step(self.vector_store, follow_up_plan)
+      before = len(retrieved_docs)
+      retrieved_docs = _merge_unique(retrieved_docs, new_docs)
+      tried_queries.extend(reasoning.follow_up_queries)
+
+      trace.append({
+          "stage": "retrieve",
+          "detail": (
+              f"[round {round_num}] agent judged evidence insufficient; "
+              f"searched {reasoning.follow_up_queries}, "
+              f"added {len(retrieved_docs) - before} new unique chunk(s)"
+          ),
+      })
+
+      reasoning = reason_step(self.llm, clean_query, retrieved_docs, tried_queries)
+      trace.append({
+          "stage": "reason",
+          "detail": f"[round {round_num}] {_reason_summary(reasoning)}",
+      })
+
+    if not reasoning.sufficient and round_num >= MAX_LOOP_ITERATIONS:
+      trace.append({
+          "stage": "guardrail",
+          "detail": (
+              f"Stopped after {MAX_LOOP_ITERATIONS} retrieve/reason rounds "
+              "(loop limit reached); generating the best-effort answer from "
+              "the evidence gathered so far rather than looping further."
+          ),
+      })
 
     # ---- Stage 4: GENERATE ------------------------------------------------
     raw_answer = generate_step(self.llm, clean_query, retrieved_docs, reasoning)
@@ -527,6 +643,7 @@ def build_agent_executor(vector_store, api_key: str) -> EnterpriseRAGAgent:
 
 
 def run_agent(agent: EnterpriseRAGAgent, user_query: str) -> AgentRunResult:
-  """Runs the Plan -> Retrieve -> Reason -> Generate loop for one query.
-  Raises AgentError (safe to show the user) on unrecoverable failure."""
+  """Runs the Plan -> (Retrieve <-> Reason)* -> Generate loop for one
+  query. Raises AgentError (safe to show the user) on unrecoverable
+  failure."""
   return agent.run(user_query)
