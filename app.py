@@ -1,6 +1,15 @@
 import streamlit as st
-from modules.ingestion import save_and_load_document, push_file_to_github
-from modules.processing import load_vectorstore, process_documents_to_vectorstore
+from modules.ingestion import (
+    save_and_load_document,
+    push_file_to_github,
+    push_folder_to_github,
+    pull_folder_from_github,
+)
+from modules.processing import (
+    CHROMA_DIR,
+    load_vectorstore,
+    process_documents_to_vectorstore,
+)
 from modules.qa_pipeline import get_qa_chain
 
 st.set_page_config(
@@ -32,6 +41,17 @@ except Exception:
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_REPO = st.secrets.get("GITHUB_REPO", "")  # e.g. "username/reponame"
 
+# On a fresh session (e.g. after a Streamlit Cloud restart/redeploy wipes
+# local disk), restore chroma_db from GitHub before anything tries to load
+# it. Only runs once per session and only if GitHub secrets are set.
+if GITHUB_TOKEN and GITHUB_REPO and "chroma_restored" not in st.session_state:
+  with st.spinner("Restoring vector database from GitHub..."):
+    try:
+      pull_folder_from_github(CHROMA_DIR, GITHUB_TOKEN, GITHUB_REPO)
+    except Exception as restore_err:
+      st.warning(f"Could not restore chroma_db from GitHub: {restore_err}")
+  st.session_state["chroma_restored"] = True
+
 # Layout: Sidebar for Uploads, Main Area for Chat
 with st.sidebar:
   st.header("📂 Document Ingestion")
@@ -51,14 +71,19 @@ with st.sidebar:
               docs, GEMINI_API_KEY
           )
 
-          # Step 3 (optional): Persist the raw file to GitHub so it
-          # survives Streamlit Cloud restarts. Skipped silently if
-          # GITHUB_TOKEN / GITHUB_REPO secrets aren't configured.
+          # Step 3 (optional): Persist the raw file AND the updated
+          # chroma_db/ vector store to GitHub so both survive Streamlit
+          # Cloud restarts. Skipped silently if GITHUB_TOKEN / GITHUB_REPO
+          # secrets aren't configured.
           github_url = None
+          chroma_files_pushed = 0
           if GITHUB_TOKEN and GITHUB_REPO:
             try:
               github_url = push_file_to_github(
                   saved_path, GITHUB_TOKEN, GITHUB_REPO
+              )
+              chroma_files_pushed = push_folder_to_github(
+                  CHROMA_DIR, GITHUB_TOKEN, GITHUB_REPO
               )
             except Exception as gh_err:
               st.warning(f"Saved locally, but GitHub backup failed: {gh_err}")
@@ -68,6 +93,12 @@ with st.sidebar:
               f"Saved to: `{saved_path}`\n\nGenerated **{chunk_count}** chunks"
               " inside `chroma_db/`"
               + (f"\n\nBacked up to GitHub: {github_url}" if github_url else "")
+              + (
+                  f"\n\nSynced **{chroma_files_pushed}** vector store files"
+                  " to GitHub"
+                  if chroma_files_pushed
+                  else ""
+              )
           )
         except Exception as e:
           st.error(f"Error processing document: {e}")
