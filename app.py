@@ -1,6 +1,7 @@
 import streamlit as st
 
-from modules.agents import AgentError, build_agent_executor, run_agent
+from modules.agents import AgentError, build_agent_executor, retrieval_only_answer, run_agent
+from modules.guardrails import InputValidationError, validate_user_input
 from modules.ingestion import (
     save_and_load_document,
     push_file_to_github,
@@ -17,13 +18,13 @@ st.set_page_config(
     page_title="Agentic Enterprise RAG with Gemini 2.5", layout="wide"
 )
 
-st.title("🤖 Agentic Enterprise RAG — Reasoning, Tools & Guardrails || Created by Sunil Kumar")
+st.title("🤖 Agentic Enterprise RAG — Reasoning, Tools & Guardrails")
 st.write(
     "Upload enterprise documents, then ask questions. Unlike a simple "
     "retrieve-then-answer chain, this app uses an **AI agent** that plans "
+    "which tools to call (document search, calculator, document listing), "
     "reasons over the results, and is wrapped in input/output guardrails "
     "to reduce hallucinations and unsafe outputs."
-    "Note: This is for testing only"
 )
 
 # --------------------------------------------------------------------------
@@ -80,11 +81,11 @@ with st.sidebar:
       def on_progress(stage: str, **info):
         if stage == "chunking_start":
           progress_bar.progress(0.05, text="Chunking document...")
-          log("Splitting document into chunks...")
+          log("📄 Splitting document into chunks...")
         elif stage == "chunking_done":
           progress_bar.progress(0.15, text="Chunking complete")
           log(
-              f" **Chunking complete** — {info['chunk_count']} chunks, "
+              f"✂️ **Chunking complete** — {info['chunk_count']} chunks, "
               f"{info['total_chars']:,} characters "
               f"(≈{info['approx_tokens']:,} tokens, estimated)"
           )
@@ -92,14 +93,14 @@ with st.sidebar:
           done, total = info["done"], info["total"]
           pct = 0.15 + 0.85 * (done / total)
           progress_bar.progress(pct, text=f"Embedding chunk {done}/{total}")
-          log(f"Embedded chunk **{done}/{total}**")
+          log(f"🧬 Embedded chunk **{done}/{total}**")
         elif stage == "embedding_done":
           progress_bar.progress(1.0, text="Embedding complete")
-          log(f"**Embedding complete** — {info['total']} chunks stored in ChromaDB")
+          log(f"✅ **Embedding complete** — {info['total']} chunks stored in ChromaDB")
 
       try:
         docs, saved_path = save_and_load_document(uploaded_file)
-        log(f"Saved file to `{saved_path}`")
+        log(f"💾 Saved file to `{saved_path}`")
 
         vector_store, chunk_count = process_documents_to_vectorstore(
             docs, GEMINI_API_KEY, progress_callback=on_progress
@@ -109,15 +110,15 @@ with st.sidebar:
         chroma_files_pushed = 0
         if GITHUB_TOKEN and GITHUB_REPO:
           try:
-            log("Backing up document to GitHub...")
+            log("☁️ Backing up document to GitHub...")
             github_url = push_file_to_github(
                 saved_path, GITHUB_TOKEN, GITHUB_REPO
             )
-            log(" Syncing `chroma_db/` to GitHub...")
+            log("☁️ Syncing `chroma_db/` to GitHub...")
             chroma_files_pushed = push_folder_to_github(
                 CHROMA_DIR, GITHUB_TOKEN, GITHUB_REPO
             )
-            log(f" Synced **{chroma_files_pushed}** vector store files to GitHub")
+            log(f"☁️ Synced **{chroma_files_pushed}** vector store files to GitHub")
           except Exception as gh_err:
             st.warning(f"Saved locally, but GitHub backup failed: {gh_err}")
 
@@ -132,12 +133,12 @@ with st.sidebar:
         )
       except Exception as e:
         progress_bar.progress(1.0, text="Failed")
-        log(f" **Error:** {e}")
+        log(f"❌ **Error:** {e}")
         st.error(f"Error processing document: {e}")
 
   st.markdown("---")
   st.caption(
-      " The agent runs Plan → Retrieve → Reason → Generate for every "
+      "🛡️ The agent runs Plan → Retrieve → Reason → Generate for every "
       "question, with input validation, prompt-injection detection, "
       "unsafe-request screening, PII redaction, and grounding checks "
       "built into the pipeline."
@@ -147,13 +148,13 @@ with st.sidebar:
 # Main: agentic Q&A
 # --------------------------------------------------------------------------
 st.markdown("---")
-st.subheader(" Ask Questions — Answered by an AI Agent")
+st.subheader("💬 Ask Questions — Answered by an AI Agent")
 
 vector_store = load_vectorstore(GEMINI_API_KEY)
 
 if vector_store is None:
   st.warning(
-      "No vector database found. Please upload and process a document via"
+      "⚠️ No vector database found. Please upload and process a document via"
       " the sidebar first."
   )
 else:
@@ -162,11 +163,20 @@ else:
   def _build_executor(_vector_store, api_key):
     return build_agent_executor(_vector_store, api_key)
 
+  # If the agent can't even be constructed (e.g. the API key is entirely
+  # invalid), don't hard-stop the app — fall back to retrieval-only mode
+  # so the user can still search their documents with zero LLM calls.
+  agent_executor = None
+  agent_unavailable_reason = None
   try:
     agent_executor = _build_executor(vector_store, GEMINI_API_KEY)
   except AgentError as e:
-    st.error(f"Could not initialize the agent: {e}")
-    st.stop()
+    agent_unavailable_reason = str(e)
+    st.warning(
+        f"⚠️ Could not initialize the AI agent ({e}). Falling back to "
+        "**retrieval-only mode** — you can still search your documents "
+        "below, just without AI-generated answers until this is resolved."
+    )
 
   if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -175,7 +185,7 @@ else:
     with st.chat_message(message["role"]):
       st.markdown(message["content"])
       for warning in message.get("warnings", []):
-        st.caption(f" {warning}")
+        st.caption(f"⚠️ {warning}")
 
   if user_query := st.chat_input(
       "Type your question regarding the uploaded documents..."
@@ -185,12 +195,37 @@ else:
       st.markdown(user_query)
 
     with st.chat_message("assistant"):
+      # ---- Retrieval-only path: agent couldn't be built at all ----------
+      # Same "RAG pipeline without LLM" fallback used mid-pipeline when
+      # generation fails (see EnterpriseRAGAgent.run() in agents.py), just
+      # entered here instead because there's no agent to run in the first
+      # place — zero LLM calls, straight to the vector store.
+      if agent_executor is None:
+        with st.spinner("Searching documents (LLM unavailable — retrieval only)..."):
+          try:
+            clean_query = validate_user_input(user_query)
+            docs = vector_store.similarity_search(clean_query, k=4)
+            answer = retrieval_only_answer(docs)
+          except InputValidationError as e:
+            answer = str(e)
+          except Exception as e:  # noqa: BLE001 - last-resort safety net
+            answer = f"Document search failed: {e}"
+
+        st.markdown(answer)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer, "warnings": []}
+        )
+        st.stop()
+
+      # ---- Normal path: full agent ---------------------------------------
       # Input validation, pre-generation guardrails (unsafe-request /
       # prompt-injection screening), and post-generation guardrails
       # (PII redaction, grounding check) all run *inside* agent.run() now
       # — see EnterpriseRAGAgent.run() in modules/agents.py — so a single
       # call here covers validate -> plan -> retrieve -> reason ->
-      # generate -> guard end to end.
+      # generate -> guard end to end. If generation itself can't reach the
+      # model (quota exhausted, etc), agent.run() already falls back to a
+      # retrieval-only answer internally rather than raising.
       with st.spinner("Agent is planning, retrieving, and reasoning..."):
         try:
           result = run_agent(agent_executor, user_query)
@@ -219,7 +254,7 @@ else:
 
       st.markdown(result.answer)
       for warning in warnings:
-        st.caption(f" {warning}")
+        st.caption(f"⚠️ {warning}")
 
       with st.expander("🔍 Agent reasoning trace — Plan → (Retrieve ↔ Reason)* → Generate"):
         stage_icons = {
