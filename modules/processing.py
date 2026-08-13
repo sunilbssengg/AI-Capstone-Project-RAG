@@ -13,7 +13,9 @@ CHROMA_DIR = "chroma_db"
 # Gemini's embedding model — lightweight (API-based), no local model
 # download, no PyTorch. Reuses the same GEMINI_API_KEY already required
 # for the LLM, so no extra secret is needed.
-EMBEDDING_MODEL = "models/text-embedding-004"
+# NOTE: "text-embedding-004" was retired by Google in early 2026 (returns
+# 404). The current model is "gemini-embedding-001".
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 
 def _get_embeddings(api_key: str):
