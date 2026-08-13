@@ -1,5 +1,5 @@
 import streamlit as st
-from modules.ingestion import save_and_load_document
+from modules.ingestion import save_and_load_document, push_file_to_github
 from modules.processing import load_vectorstore, process_documents_to_vectorstore
 from modules.qa_pipeline import get_qa_chain
 
@@ -25,6 +25,13 @@ except Exception:
   )
   st.stop()
 
+# Optional: GitHub persistence for uploaded files. Only active if both
+# secrets are set — silently skipped otherwise (local-disk-only behavior,
+# same as before). See SECURITY WARNING in modules/ingestion.py before
+# enabling this on a public app.
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
+GITHUB_REPO = st.secrets.get("GITHUB_REPO", "")  # e.g. "username/reponame"
+
 # Layout: Sidebar for Uploads, Main Area for Chat
 with st.sidebar:
   st.header("📂 Document Ingestion")
@@ -44,10 +51,23 @@ with st.sidebar:
               docs, GEMINI_API_KEY
           )
 
+          # Step 3 (optional): Persist the raw file to GitHub so it
+          # survives Streamlit Cloud restarts. Skipped silently if
+          # GITHUB_TOKEN / GITHUB_REPO secrets aren't configured.
+          github_url = None
+          if GITHUB_TOKEN and GITHUB_REPO:
+            try:
+              github_url = push_file_to_github(
+                  saved_path, GITHUB_TOKEN, GITHUB_REPO
+              )
+            except Exception as gh_err:
+              st.warning(f"Saved locally, but GitHub backup failed: {gh_err}")
+
           st.success(f"Successfully processed {uploaded_file.name}!")
           st.info(
               f"Saved to: `{saved_path}`\n\nGenerated **{chunk_count}** chunks"
               " inside `chroma_db/`"
+              + (f"\n\nBacked up to GitHub: {github_url}" if github_url else "")
           )
         except Exception as e:
           st.error(f"Error processing document: {e}")
