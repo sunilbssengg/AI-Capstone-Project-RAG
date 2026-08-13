@@ -22,11 +22,38 @@ def _get_embeddings(api_key: str):
     return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=api_key)
 
 
-def process_documents_to_vectorstore(documents, api_key: str):
-  """Applies chunking/tokenization concepts and stores data in ChromaDB."""
+# Chars-per-token is model-dependent; Gemini doesn't expose a public local
+# tokenizer, so this is a standard, commonly-used approximation (~4 chars
+# per token for English text) — good enough to show the user a ballpark
+# figure, not an exact billing count.
+CHARS_PER_TOKEN_ESTIMATE = 4
+
+EMBED_BATCH_SIZE = 10
+
+
+def process_documents_to_vectorstore(
+    documents, api_key: str, progress_callback=None, batch_size: int = EMBED_BATCH_SIZE
+):
+  """
+  Applies chunking/tokenization concepts and stores data in ChromaDB.
+
+  progress_callback(stage: str, **info) is called at each step so a UI
+  (e.g. Streamlit) can render live token/chunking/embedding detail
+  instead of a single opaque spinner. Stages emitted, in order:
+    - "chunking_start"
+    - "chunking_done"   -> chunk_count, total_chars, approx_tokens
+    - "embedding_progress" -> done, total (called once per batch)
+    - "embedding_done"  -> total
+  progress_callback is optional; pass None to run silently as before.
+  """
+
+  def emit(stage, **info):
+    if progress_callback is not None:
+      progress_callback(stage, **info)
 
   # Chunking Strategy: Recursive text splitting tracking structural token/character boundaries
   # chunk_size defines token/character limits; chunk_overlap maintains context continuity between chunks.
+  emit("chunking_start")
   text_splitter = RecursiveCharacterTextSplitter(
       chunk_size=1000,
       chunk_overlap=200,
@@ -35,14 +62,31 @@ def process_documents_to_vectorstore(documents, api_key: str):
   )
 
   chunks = text_splitter.split_documents(documents)
+  total_chars = sum(len(c.page_content) for c in chunks)
+  approx_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
+  emit(
+      "chunking_done",
+      chunk_count=len(chunks),
+      total_chars=total_chars,
+      approx_tokens=approx_tokens,
+  )
 
   # Initialize Embedding Model (Gemini API — no local model, no PyTorch)
   embeddings = _get_embeddings(api_key)
 
-  # Store vectors and metadata inside the local chroma_db folder
-  vector_store = Chroma.from_documents(
-      documents=chunks, embedding=embeddings, persist_directory=CHROMA_DIR
-  )
+  # Create the (possibly-empty, possibly-existing) persistent Chroma store
+  # up front, then add chunks in small batches instead of one single
+  # from_documents() call — this is what lets us report real progress
+  # instead of blocking silently on one giant embedding request.
+  vector_store = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+
+  total = len(chunks)
+  for start in range(0, total, batch_size):
+    batch = chunks[start : start + batch_size]
+    vector_store.add_documents(batch)
+    emit("embedding_progress", done=min(start + batch_size, total), total=total)
+
+  emit("embedding_done", total=total)
 
   return vector_store, len(chunks)
 
