@@ -19,7 +19,7 @@ GitHub-backed `chroma_db/` persistence) are identical to the base project
 — only the *question-answering* stage changes, from a fixed retrieve-then-
 generate chain to an agent that plans its own tool calls.
 
-## 1. Agent-based reasoning (`modules/agents.py`)
+## 1. Agent-based reasoning
 Plan → Retrieve → Reason → Generate pipeline
 
 - **`retrieve_documents`** — semantic search over the ingested documents
