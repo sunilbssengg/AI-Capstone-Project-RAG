@@ -62,6 +62,112 @@ def push_file_to_github(file_path: str, github_token: str, github_repo: str,
   return result["content"].html_url
 
 
+def push_folder_to_github(folder_path: str, github_token: str, github_repo: str,
+                           repo_path_prefix: str | None = None) -> int:
+  """
+  Recursively commits every file inside `folder_path` (e.g. the Chroma
+  persist directory) to GitHub, so the vector DB survives Streamlit Cloud
+  restarts. Same SECURITY WARNING as push_file_to_github applies.
+
+  Returns the number of files pushed. Silently returns 0 if the token/repo
+  secrets aren't configured.
+
+  NOTE: uses the GitHub Contents API, which caps individual files at 1MB.
+  Chroma's sqlite/bin files can exceed that as your corpus grows — if you
+  hit that limit, switch to the Git Data (tree/blob) API instead.
+  """
+  if not github_token or not github_repo:
+    return 0
+
+  from github import Github, GithubException
+
+  repo_path_prefix = repo_path_prefix or os.path.basename(
+      folder_path.rstrip("/")
+  )
+  gh = Github(github_token)
+  repo = gh.get_repo(github_repo)
+
+  pushed = 0
+  for root, _dirs, files in os.walk(folder_path):
+    for fname in files:
+      local_path = os.path.join(root, fname)
+      rel_path = os.path.relpath(local_path, folder_path)
+      repo_path = f"{repo_path_prefix}/{rel_path}".replace(os.sep, "/")
+
+      with open(local_path, "rb") as f:
+        content_bytes = f.read()
+
+      try:
+        existing = repo.get_contents(repo_path)
+        repo.update_file(
+            path=repo_path,
+            message=f"Update vector store file: {rel_path}",
+            content=content_bytes,
+            sha=existing.sha,
+        )
+      except GithubException as exc:
+        if exc.status == 404:
+          repo.create_file(
+              path=repo_path,
+              message=f"Add vector store file: {rel_path}",
+              content=content_bytes,
+          )
+        else:
+          raise
+      pushed += 1
+
+  return pushed
+
+
+def pull_folder_from_github(folder_path: str, github_token: str, github_repo: str,
+                             repo_path_prefix: str | None = None) -> int:
+  """
+  Restores `folder_path` (e.g. chroma_db/) from GitHub before the app
+  tries to load it. Needed because Streamlit Cloud wipes local disk on
+  every restart/redeploy — GitHub is the only durable copy.
+
+  Returns the number of files restored. Silently returns 0 if the
+  token/repo secrets aren't configured, or the repo path doesn't exist yet
+  (first-ever run, nothing to restore).
+  """
+  if not github_token or not github_repo:
+    return 0
+
+  from github import Github, GithubException
+
+  repo_path_prefix = repo_path_prefix or os.path.basename(
+      folder_path.rstrip("/")
+  )
+  gh = Github(github_token)
+  repo = gh.get_repo(github_repo)
+
+  try:
+    contents = repo.get_contents(repo_path_prefix)
+  except GithubException as exc:
+    if exc.status == 404:
+      return 0
+    raise
+
+  restored = 0
+  # get_contents returns a single item for a file, a list for a directory
+  stack = contents if isinstance(contents, list) else [contents]
+  while stack:
+    item = stack.pop()
+    if item.type == "dir":
+      stack.extend(repo.get_contents(item.path))
+      continue
+
+    local_path = os.path.join(
+        folder_path, os.path.relpath(item.path, repo_path_prefix)
+    )
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    with open(local_path, "wb") as f:
+      f.write(item.decoded_content)
+    restored += 1
+
+  return restored
+
+
 def save_and_load_document(uploaded_file):
   """Saves uploaded enterprise document locally and loads it via LangChain."""
   file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
