@@ -181,16 +181,30 @@ _TRANSIENT_ERROR_MARKERS = (
     "temporarily unavailable", "connection",
 )
 
+# Quota exhaustion (e.g. free-tier daily request cap) looks like a 429 too,
+# but retrying seconds later never helps a *daily* cap — it only burns more
+# of whatever quota might still be left. Treated as its own category so we
+# fail fast (zero retries) instead of tripling API usage on a doomed call.
+_QUOTA_ERROR_MARKERS = (
+    "quota", "resource_exhausted", "resourceexhausted", "exceeded your current quota",
+)
+
 
 def _is_transient(exc: Exception) -> bool:
   msg = str(exc).lower()
   return any(marker in msg for marker in _TRANSIENT_ERROR_MARKERS)
 
 
+def is_quota_exhausted(exc: Exception) -> bool:
+  msg = str(exc).lower()
+  return any(marker in msg for marker in _QUOTA_ERROR_MARKERS)
+
+
 def _invoke_llm_with_retry(llm, messages, stage_name: str) -> str:
   """Calls the LLM with retry-on-transient-failure. Raises AgentError
   (safe to show the user) on non-transient failures or after exhausting
-  retries."""
+  retries. Quota-exhaustion errors are never retried — see
+  _QUOTA_ERROR_MARKERS above."""
   last_exc: Exception | None = None
   for attempt in range(1, MAX_RETRIES + 1):
     try:
@@ -203,6 +217,8 @@ def _invoke_llm_with_retry(llm, messages, stage_name: str) -> str:
       raise
     except Exception as exc:  # noqa: BLE001 - any LLM/runtime failure
       last_exc = exc
+      if is_quota_exhausted(exc):
+        break  # a daily quota cap won't clear within a backoff window — don't waste it
       if attempt < MAX_RETRIES and _is_transient(exc):
         time.sleep(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
         continue
@@ -498,6 +514,37 @@ def generate_step(
 # --------------------------------------------------------------------------
 
 
+def retrieval_only_answer(retrieved_docs: list, reasoning: ReasoningResult | None = None) -> str:
+  """
+  Builds a response with ZERO LLM calls, used when the generation step
+  can't reach the model at all (quota exhausted, bad/missing API key,
+  network down, etc). Surfaces the raw retrieved excerpts directly so the
+  user still gets something useful from the RAG pipeline instead of a
+  hard failure — this is the "RAG pipeline without LLM" fallback path.
+  """
+  if not retrieved_docs:
+    return (
+        "⚠️ The language model is currently unavailable, and no relevant "
+        "excerpts were found in the ingested documents for this question "
+        "either — nothing to show without the model to interpret it."
+    )
+
+  header = (
+      "⚠️ **The language model is currently unavailable** (e.g. API quota "
+      "exceeded or invalid API key), so this is a **retrieval-only** "
+      "result — the most relevant excerpts found in your documents, "
+      "shown as-is without AI-generated summarization:\n\n"
+  )
+  body = _format_docs(retrieved_docs)
+  notes = (
+      f"\n\n---\n*Reasoning stage notes (also generated without the "
+      f"model unavailable at that point): {reasoning.notes}*"
+      if reasoning and reasoning.notes and "failed" not in reasoning.notes.lower()
+      else ""
+  )
+  return header + body + notes
+
+
 def _reason_summary(reasoning: ReasoningResult) -> str:
   summary = reasoning.notes
   if reasoning.calculation_expression:
@@ -620,8 +667,27 @@ class EnterpriseRAGAgent:
       })
 
     # ---- Stage 4: GENERATE ------------------------------------------------
-    raw_answer = generate_step(self.llm, clean_query, retrieved_docs, reasoning)
-    trace.append({"stage": "generate", "detail": raw_answer})
+    # If the model is unreachable here (quota exhausted, bad API key,
+    # network down, etc), don't fail the whole request — fall back to a
+    # retrieval-only answer built entirely from what RETRIEVE already
+    # found, with zero further LLM calls.
+    try:
+      raw_answer = generate_step(self.llm, clean_query, retrieved_docs, reasoning)
+      trace.append({"stage": "generate", "detail": raw_answer})
+    except AgentError as exc:
+      trace.append({
+          "stage": "guardrail",
+          "detail": (
+              f"Generation step could not reach the language model ({exc}); "
+              "falling back to a retrieval-only answer (raw document "
+              "excerpts, no LLM synthesis) instead of failing the request."
+          ),
+      })
+      raw_answer = retrieval_only_answer(retrieved_docs, reasoning)
+      trace.append({
+          "stage": "generate",
+          "detail": f"[fallback: retrieval-only, no LLM] {raw_answer[:300]}",
+      })
 
     # ---- Output guardrails -------------------------------------------
     guarded = apply_output_guardrails(raw_answer, retrieved_docs)
